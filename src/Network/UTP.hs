@@ -20,10 +20,13 @@ import System.Random
 import Data.Dequeue as DQ
 import Control.Monad.IO.Class
 import Data.Time.Clock.POSIX
-
--- bittorrent utp protocol
-proto = undefined
-
+import Control.Concurrent
+import System.Log.Logger
+import System.Log.Handler.Syslog
+import Control.Concurrent.STM.TChan
+import Control.Concurrent
+import Control.Monad.Trans.Either
+import Data.Either.Combinators
 -- interface?
 {-
 
@@ -70,8 +73,33 @@ keep acking regularly for the last received package. if you receive
 
 there's a haskell package for UTP by sam truszan
 but that code is just too smart for me
+
+EXCEPTION HANDLING AND CLOSING
+
+exceptions:
+udp connection is dropped
+  happens in recv thread or send thread. set conn state to ERR
+  next time a user calls send or recv he gets the error
+   < quite complicated > 
+timeout?
+  leave it to the connection user to handle; block indefinetly if needed
+malformed packets coming our way -> just ignore them
+
+CLOSURE
+
+need to kill associated threads
+  recv thread
+  ack thread
+  resend thread
+keep track of their threadId in the ConnData
+close socket as well
+
+
 -}
 
+
+-- logging
+utplogger = "utplog"
 
 -- packet parsing
 
@@ -99,6 +127,7 @@ data Packet = Packet {
 headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
 defWindowSize = 500
 recvBufferSize = 10000
+recvSize = 10000
 
 packetSize p = headerSize + (BS.length $ payload p)
 
@@ -107,6 +136,7 @@ data Connection = Conn {
     send :: ByteString -> IO ()
   , recvLen :: Int -> IO (ByteString, Int)
   , recv :: Int -> IO ByteString
+  , close :: IO ()
   }
 
 {-
@@ -170,6 +200,10 @@ instance Serialize Packet where
     putWord16be ackNum 
     putByteString payload
 
+
+-- warning: partial initialization
+makePacket pType load conn
+  = Packet {packetType = pType, payload = load, connectionId = connIdRecv conn}
 {-
 
   this function sets the following fields of packet
@@ -194,33 +228,81 @@ sendPacket packet conn = do
     return $ packet {seqNum = currSeq, ackNum = connAckNum state
                     , timeDiff = replyMicro state
                     , windowSize = fromIntegral $ dqSize inB (BS.length)}
-  micros <- fmap (\n -> P.round $ n * 10 ^ 6) $ liftIO $ getPOSIXTime
+  micros <- getTimeMicros 
   liftIO $ NSB.send (connSocket conn) (DS.encode $ sequenced {time = micros})        
   return ()
  
+-- what a client calls
+utpConnect :: MonadIO m => Socket -> m Connection
+utpConnect sock = do
+  g <- liftIO $ newStdGen
+  let randId = P.head $ (randoms g :: [Word16])
+  let initState = ConnState {connSeqNum = 1,
+                            connAckNum = 0,
+                            connStage = CS_SYN_SENT,
+                            maxWindow = defWindowSize,
+                            peerMaxWindow = defWindowSize,
+                            replyMicro = 0}
+ 
+  stateVar <- liftIO $ newTVarIO initState 
+  inBufVar <- liftIO $ newTVarIO DQ.empty 
+  outBufVar <- liftIO $ newTVarIO DQ.empty 
+  let conn = ConnData stateVar inBufVar outBufVar sock randId (randId + 1)
 
-udpToUTPClient :: MonadIO m => Socket -> m Connection
-udpToUTPClient sock = do
- g <- liftIO $ newStdGen
- let randId = P.head $ (randoms g :: [Word16])
- let connState = ConnState {connSeqNum = 1,
-                           connAckNum = 0,
-                           connStage = CS_SYN_SENT,
-                           maxWindow = defWindowSize,
-                           peerMaxWindow = defWindowSize,
-                           replyMicro = 0}
 
- stateVar <- liftIO $ newTVarIO connState
- inBufVar <- liftIO $ newTVarIO DQ.empty 
- outBufVar <- liftIO $ newTVarIO DQ.empty 
- let connData = ConnData stateVar inBufVar outBufVar sock randId (randId + 1)
+  done <- liftIO $ newTChanIO 
+  liftIO $ forkIO $ do -- recv thread
+    msg <- NSB.recv sock recvSize
+    case (DS.decode msg :: Either String Packet) of
+      Left err -> do
+        -- TODO: handle this properly
+        liftIO $ errorM utplogger "ERROR: unparsable package"
+      Right packet -> do
+        when (packetType packet == ST_STATE) $ do
+          liftIO $ atomically $ modifyTVar (connState conn)
+                   (\s -> s {connStage = CS_CONNECTED}) 
+          liftIO $ atomically $ writeTChan done True -- signal 
+           
+    return ()
+  
+  -- block here until syn-ack stage is done
+  liftIO $ atomically $ readTChan done
 
+  return $ Conn (\bs -> return ()) (\n -> return ("", 0)) (\n -> return "") (return () )
+  {- do
+   send sock ""
+   resp <- recv sock headerLen 
+   -}
 
- return $ Conn (\bs -> return ()) (\n -> return ("", 0)) (\n -> return "")
+-- what a server calls
+utpAccept :: Socket -> IO ()
+utpAccept = undefined
 
- {- do
-  send sock ""
-  resp <- recv sock headerLen 
-  -}
+-- loops until it reads a valid packet
+recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
+    msg <- liftIO $ NSB.recv sock  recvSize
+    case (DS.decode msg :: Either String Packet) of
+      Left err -> do
+        -- keep looping listening for packets
+        -- TODO: maybe this should be more strict and close the connection
+        liftIO $ errorM utplogger "Unparsable package"
+      Right packet -> left packet -- exit loop
 
+ 
+getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ liftIO $ getPOSIXTime
+
+killer = do
+  tid <- forkIO $ do
+    P.putStrLn "le parent"
+    forkIO $ forever $ do
+      P.putStrLn "i am a child"
+      threadDelay $ 10 ^ 6
+    return ()
+  line <- P.getLine
+  killThread tid
+  P.putStrLn line
+  threadDelay $ 10 ^ 8
+
+ 
 if' c a b = if c then a else b
+unwrapLeft (Left x) = x
