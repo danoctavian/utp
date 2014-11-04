@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DeriveDataTypeable #-} 
 
 module Network.UTP where
 
@@ -27,6 +28,11 @@ import Control.Concurrent.STM.TChan
 import Control.Concurrent
 import Control.Monad.Trans.Either
 import Data.Either.Combinators
+import Control.Concurrent.Async
+import Control.Exception
+import Data.Typeable
+import Data.HashTable.IO
+import Data.Map.Strict as Map 
 -- interface?
 {-
 
@@ -55,9 +61,7 @@ CIRCULAR BUFFER IDEA
 a circular buffer can achieve the adding and consuming of the buffer
 no problem about providing a stream based interface here.
 
-
 need to work with some sort of mutable bytestrings.
-
 
 buffer expansion means:  copy everything in the new buffer
   if bigger all good
@@ -97,6 +101,14 @@ close socket as well
 
 -}
 
+{-
+
+TODO: missing features
+
+** window resizing
+** rtt based timeouts 
+-}
+
 
 -- logging
 utplogger = "utplog"
@@ -127,7 +139,9 @@ data Packet = Packet {
 headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
 defWindowSize = 500
 recvBufferSize = 10000
-recvSize = 10000
+recvSize = 2048 -- TODO: really need to have some logic behind this value
+
+defResendTimeout = 5 * 10 ^ 5
 
 packetSize p = headerSize + (BS.length $ payload p)
 
@@ -139,14 +153,8 @@ data Connection = Conn {
   , close :: IO ()
   }
 
-{-
-data Connection = Conn {
-     connIdRecv :: ConnectionId        
-   , connIdSend :: ConnectionId        
-  }
--}
 
-data ConnStage = CS_SYN_SENT | CS_CONNECTED deriving (Show, Eq)
+data ConnStage = CS_SYN_SENT | CS_CONNECTED | ERROR deriving (Show, Eq)
 
 data ConnData = ConnData {
     connState :: TVar ConnState
@@ -161,7 +169,10 @@ data ConnData = ConnData {
 -- dumb summing up of sizes
 -- optimize by keeping track of size on removal and insertion
 dqSize :: Dequeue q => q a -> (a -> Int)  -> Int
-dqSize dq len = P.sum $ P.map len $ DQ.takeFront (DQ.length dq) dq
+dqSize dq len = P.sum $ P.map len $ dqToList dq
+
+dqToList dq = DQ.takeFront (DQ.length dq) dq
+
 
 data ConnState = ConnState {
     connSeqNum :: SeqNum
@@ -231,7 +242,11 @@ sendPacket packet conn = do
   micros <- getTimeMicros 
   liftIO $ NSB.send (connSocket conn) (DS.encode $ sequenced {time = micros})        
   return ()
- 
+
+-- TODO: remove
+fooConn = Conn (\bs -> return ()) (\n -> return ("", 0)) (\n -> return "") (return () )
+
+
 -- what a client calls
 utpConnect :: MonadIO m => Socket -> m Connection
 utpConnect sock = do
@@ -249,60 +264,133 @@ utpConnect sock = do
   outBufVar <- liftIO $ newTVarIO DQ.empty 
   let conn = ConnData stateVar inBufVar outBufVar sock randId (randId + 1)
 
+  startHS <- liftIO $ getTimeMicros
+  liftIO $ sendPacket (makePacket ST_SYN "" conn) conn
 
-  done <- liftIO $ newTChanIO 
-  liftIO $ forkIO $ do -- recv thread
-    msg <- NSB.recv sock recvSize
-    case (DS.decode msg :: Either String Packet) of
-      Left err -> do
-        -- TODO: handle this properly
-        liftIO $ errorM utplogger "ERROR: unparsable package"
-      Right packet -> do
-        when (packetType packet == ST_STATE) $ do
-          liftIO $ atomically $ modifyTVar (connState conn)
-                   (\s -> s {connStage = CS_CONNECTED}) 
-          liftIO $ atomically $ writeTChan done True -- signal 
-           
-    return ()
-  
+  -- run resend thread
+  liftIO $ forkIO $ setInterval defResendTimeout $ resendOutgoing conn
+
+  asyncRecv <- liftIO $ async (ackRecv conn) -- waiting for the first ack
+  fstAck <- liftIO $ wait asyncRecv
+  endHS <- liftIO $ getTimeMicros 
+  let initRtt = endHS - startHS 
+   
+  -- things worked out 
+  liftIO $ atomically $ modifyTVar (connState conn)
+           (\s -> s {connStage = CS_CONNECTED, connAckNum = seqNum fstAck})
+
+
   -- block here until syn-ack stage is done
-  liftIO $ atomically $ readTChan done
+  return $ fooConn 
+data UTPException = FailedHandshake deriving (Show, Typeable)
+instance Exception UTPException
 
-  return $ Conn (\bs -> return ()) (\n -> return ("", 0)) (\n -> return "") (return () )
-  {- do
-   send sock ""
-   resp <- recv sock headerLen 
-   -}
+{- server call
+  not optimized to handle a large number of calls
+  good enough to handle p2p apps with something 
+  like at most 100 connections
 
--- what a server calls
-utpAccept :: Socket -> IO ()
-utpAccept = undefined
+  TODO: figure out how to graciously kill this.
+-}
+
+
+utpListen :: Socket -> (SockAddr -> Connection -> IO()) -> IO ()
+utpListen sock handle = do
+  connMapVar <- newTVarIO Map.empty
+  forever $ do
+    (packet, sockAddr) <- recvPacket sock recvSize
+    connMap <- atomically $ readTVar connMapVar
+    case (Map.lookup sockAddr connMap) of
+      Just inChan -> atomically $ writeTChan inChan packet
+      Nothing -> do
+        -- new connection - fork thread to handle this
+        forkIO $ do
+          inChan <- atomically $ do
+            inChan <- newTChan
+            modifyTVar connMapVar (Map.insert sockAddr inChan)
+            return inChan
+          (serverHandshake inChan sock sockAddr >>= handle sockAddr)
+          `finally`
+          (atomically $ modifyTVar connMapVar (Map.delete sockAddr) )
+        return ()
+
+serverHandshake :: TChan Packet -> Socket -> SockAddr -> IO Connection
+serverHandshake packChan sock sockAddr  = do
+  packet <- atomically $ readTChan packChan 
+  when (packetType packet /= ST_SYN) $ throwIO FailedHandshake
+  -- start acking and return the connection 
+  return undefined
 
 -- loops until it reads a valid packet
 recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
-    msg <- liftIO $ NSB.recv sock  recvSize
+    (msg, src) <- liftIO $ NSB.recvFrom sock recvSize
     case (DS.decode msg :: Either String Packet) of
       Left err -> do
         -- keep looping listening for packets
         -- TODO: maybe this should be more strict and close the connection
         liftIO $ errorM utplogger "Unparsable package"
-      Right packet -> left packet -- exit loop
+      Right packet -> left (packet, src) -- exit loop
 
  
 getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ liftIO $ getPOSIXTime
+setInterval t f = forever $ threadDelay t >> f
 
-killer = do
-  tid <- forkIO $ do
-    P.putStrLn "le parent"
-    forkIO $ forever $ do
-      P.putStrLn "i am a child"
-      threadDelay $ 10 ^ 6
-    return ()
-  line <- P.getLine
-  killThread tid
-  P.putStrLn line
-  threadDelay $ 10 ^ 8
+ackRecv conn = do
+  packet <- fmap P.fst $ recvPacket (connSocket conn) recvSize
+  case (packetType packet) of
+    ST_STATE -> handleAck conn packet >> return packet
+    _ -> do
+      liftIO $ errorM utplogger "got something other than ack"
+      liftIO $ throwIO FailedHandshake
 
+resendSyn conn = do
+  x <- runEitherT $ forever $ do
+    state <- liftIO $ atomically $ readTVar (connState conn)    
+    when (connStage state /= CS_SYN_SENT) $ left () -- exit the loop
+    liftIO $ sendPacket (makePacket ST_SYN "" conn) conn
+    liftIO $ threadDelay $ defResendTimeout
+  return ()
+
+
+-- takes first elems returning remaining DQ
+dqTakeWhile :: Dequeue q => (a -> Bool) -> q a -> ([a], q a)
+dqTakeWhile cond dq = case DQ.length dq of
+  0 -> ([], dq)
+  _ -> let (taken, rest) = dqTakeWhile cond (P.snd $ popFront dq) in 
+         if' (cond $ fromJust $ DQ.first dq)
+          ((fromJust $ DQ.first dq) : taken, rest) 
+          ([], dq)
+
+
+handleAck conn packet = atomically $ modifyTVar (outBuf conn)
+                (P.snd . (dqTakeWhile ((<= ackNum packet) . seqNum)))
+
+resendOutgoing conn = do
+  outgoing <- atomically $ readTVar (outBuf conn)
+  forM (dqToList outgoing) $ \p -> NSB.send (connSocket conn) $ DS.encode p
+  return ()
  
+ 
+
+recvIncoming :: ConnData -> Packet ->  IO ()
+recvIncoming conn packet = case packetType packet of
+  ST_SYN -> do
+    atomically $ modifyTVar (connState conn)
+                  (\s -> s {connAckNum = seqNum packet
+                          , connStage = CS_CONNECTED})
+    sendPacket (makePacket ST_STATE "" conn) conn
+  ST_STATE -> handleAck conn packet
+  ST_DATA -> do
+    atomically $ do
+      stateNow <- readTVar $ connState conn
+      when (connAckNum stateNow + 1 == ackNum packet) $ do
+        modifyTVar (inBuf conn) (P.flip DQ.pushBack $ payload packet)
+        modifyTVar (connState conn) (\s -> s {connAckNum = seqNum packet})
+    sendPacket (makePacket ST_STATE "" conn) conn -- ack
+
+      
+      
+
+-- helpers 
 if' c a b = if c then a else b
 unwrapLeft (Left x) = x
