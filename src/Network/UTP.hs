@@ -113,7 +113,7 @@ data Packet = Packet {
     payload :: ByteString
   } deriving (Show, Eq)
 
-defPacket = Packet ST_SYN 0 0 0 0 0 0 0 0 ""
+defPacket = Packet ST_FIN 0 0 0 0 0 0 0 0 ""
 
 -- CONSTANTS
 headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
@@ -154,7 +154,6 @@ dqSize dq len = P.sum $ P.map len $ dqToList dq
 
 dqToList dq = DQ.takeFront (DQ.length dq) dq
 
-
 data ConnState = ConnState {
     connSeqNum :: SeqNum
   , connAckNum :: AckNum
@@ -169,7 +168,7 @@ packetTypeMap = P.zip [0, 1..] [ST_DATA, ST_FIN, ST_STATE, ST_RESET, ST_SYN]
 getTypeVersion = do
   byte <- getWord8 
   let packType = P.lookup (shiftR byte 4) packetTypeMap
-  let version = shiftL (shiftL byte 4) 4
+  let version = shiftR (shiftL byte 4) 4
   case packType of 
     Just typeVal ->  return (typeVal, version)
     Nothing -> fail "unknown packet type"
@@ -240,24 +239,24 @@ sendPacket packet conn = do
     state <- readTVar $ connState conn 
     out <- readTVar $ outBuf conn
     let currSeq = connSeqNum state
-
-    -- acks are not buffered and don't inc sequence number
-    when (packetType packet /= ST_STATE) $ do
-
-      -- if there is no space in the buffer block and retry later
-      when (maxWindow state < fromIntegral ((packetSize packet) + dqSize out packetSize))
-        retry
-      writeTVar (outBuf conn) (pushBack out packet)
-      writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
-
     inB <- readTVar $ inBuf conn
-    return $ packet {seqNum = currSeq, ackNum = connAckNum state
+    let sequenced = packet {seqNum = currSeq, ackNum = connAckNum state
                     , timeDiff = replyMicro state
                     , windowSize = fromIntegral $ dqSize inB (BS.length)}
 
-  debugM  utplogger $ "sending packet..." ++ (show sequenced)
+    -- acks are not buffered and don't inc sequence number
+    when (packetType sequenced /= ST_STATE) $ do
+      -- if there is no space in the buffer block and retry later
+      when (maxWindow state < fromIntegral ((packetSize sequenced) + dqSize out packetSize))
+        retry
+      writeTVar (outBuf conn) (pushBack out sequenced)
+      writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
+    return sequenced
+
   micros <- getTimeMicros 
-  (sockSend conn) (DS.encode $ sequenced {time = micros})        
+  let timestamped = sequenced {time = micros}
+  debugM  utplogger $ "sending packet..." ++ (show timestamped)
+  (sockSend conn) (DS.encode $ timestamped)        
   return ()
 
 -- TODO: remove
@@ -319,6 +318,7 @@ utpListen sock handle = do
           inChan <- atomically $ do
             inChan <- newTChan
             modifyTVar connMapVar (Map.insert sockAddr inChan)
+            writeTChan inChan packet -- push the first message in the chan
             return inChan
           (serverHandshake inChan sock sockAddr >>= handle sockAddr)
           `finally`
@@ -330,7 +330,7 @@ serverHandshake packChan sock sockAddr  = do
   packet <- atomically $ readTChan packChan 
   when (packetType packet /= ST_SYN) $ throwIO FailedHandshake
 
-  debugM utplogger "received syn packet"
+  debugM utplogger $ "received syn packet " ++ (show packet)
 
   g <- liftIO $ newStdGen
   let randNum = P.head $ (randoms g :: [Word16])
@@ -454,14 +454,14 @@ socketEcho sock = do
 clientUTP =  do
   updateGlobalLogger utplogger (setLevel DEBUG)
   withSocketsDo $ do
-    P.putStrLn "running"
+    debugM utplogger "running"
     sock <- socket AF_INET Datagram 0
     NS.connect sock (SockAddrInet echoPort (toWord32 [127, 0, 0, 1]))
     conn <- utpConnect sock
     Network.UTP.send conn  "hello"
-    P.putStrLn "sent message "
+    debugM utplogger "sent message "
     resp <- Network.UTP.recv conn 2
-    P.putStrLn $ show resp
+    debugM utplogger $ "got echo response " ++ (show resp)
 
 
 utpechoserver :: IO ()
@@ -476,7 +476,7 @@ utpechoserver = do
 utpsocketEcho :: SockAddr -> Connection -> IO ()
 utpsocketEcho addr conn = forever $ do
            mesg  <- Network.UTP.recv conn maxline
-           P.putStrLn $ "got message from utp socket " ++ (show mesg)
+           debugM utplogger $ "got message from utp socket " ++ (show mesg)
            send_count <- Network.UTP.send conn mesg 
            return ()
 --           send_count <- NS.sendTo sock mesg client
