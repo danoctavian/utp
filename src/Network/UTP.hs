@@ -280,7 +280,7 @@ utpConnect sock = do
   let recvF = fmap P.fst $ recvPacket (connSocket conn) recvSize
 
   -- block here until syn-ack stage is done
-  fstAck <- liftIO $ ackRecv recvF conn
+  fstAck <- ackRecv recvF conn
   -- handshake is succseful
 
   atomically $ modifyTVar (connState conn)
@@ -332,7 +332,7 @@ serverHandshake packChan sock sockAddr  = do
 
   debugM utplogger $ "received syn packet " ++ (show packet)
 
-  g <- liftIO $ newStdGen
+  g <- newStdGen
   let randNum = P.head $ (randoms g :: [Word16])
   conn <- initConn (connId packet) (connId packet + 1) randNum (seqNum packet)
           sock (\bs -> NSB.sendTo sock bs sockAddr)
@@ -356,7 +356,7 @@ recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
       Right packet -> left (packet, src) -- exit loop
 
  
-getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ liftIO $ getPOSIXTime
+getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ getPOSIXTime
 setInterval t f = forever $ threadDelay t >> f
 
 ackRecv recv conn = do
@@ -364,8 +364,8 @@ ackRecv recv conn = do
   case (packetType packet) of
     ST_STATE -> handleAck conn packet >> return packet
     _ -> do
-      liftIO $ errorM utplogger "got something other than ack"
-      liftIO $ throwIO FailedHandshake
+      errorM utplogger "got something other than ack"
+      throwIO FailedHandshake
 
 -- takes first elems returning remaining DQ
 dqTakeWhile :: Dequeue q => (a -> Bool) -> q a -> ([a], q a)
@@ -391,11 +391,14 @@ recvIncoming conn packet = case packetType packet of
     sendPacket (makePacket ST_STATE "" conn) conn
   ST_STATE -> handleAck conn packet
   ST_DATA -> do
-    atomically $ do
+    inB <- atomically $ do
       stateNow <- readTVar $ connState conn
       when (connAckNum stateNow + 1 == seqNum packet) $ do
         modifyTVar (inBuf conn) (P.flip DQ.pushBack $ payload packet)
         modifyTVar (connState conn) (\s -> s {connAckNum = seqNum packet})
+      readTVar (inBuf conn)
+
+    debugM utplogger $ show inB
     sendPacket (makePacket ST_STATE "" conn) conn -- ack
 
 
