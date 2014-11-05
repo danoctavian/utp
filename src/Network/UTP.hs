@@ -33,30 +33,7 @@ import Control.Exception
 import Data.Typeable
 import Data.HashTable.IO
 import Data.Map.Strict as Map 
--- interface?
 {-
-
-what i need: 
-map udp connection to utp connection
-
-upgradeToUTP :: Socket -> IO Socket
-
-functions:
-* send
-* recv
-* recvLen
-
-ignore listen/accept and all the other stuff for now for now
-
-Packet based or stream based? The way the interface is now
-it's stream based.
-
-incoming-buffer
-|    ||         ||      ||
-just append at the end i guess? append is O(N + m)
-how to consume ? split bytestring
--- buffer size is fixed; potentially changed by the formula
-
 CIRCULAR BUFFER IDEA
 a circular buffer can achieve the adding and consuming of the buffer
 no problem about providing a stream based interface here.
@@ -126,7 +103,7 @@ data Packet = Packet {
     packetType :: PacketType,
     version :: Word8,
     extensions :: Word8, -- ignore it for now
-    connectionId :: Word16,
+    connId :: Word16,
     time :: Time,
     timeDiff :: Time,
     windowSize :: Word32,
@@ -140,6 +117,7 @@ headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
 defWindowSize = 500
 recvBufferSize = 10000
 recvSize = 2048 -- TODO: really need to have some logic behind this value
+versionNum = 1
 
 defResendTimeout = 5 * 10 ^ 5
 
@@ -148,7 +126,6 @@ packetSize p = headerSize + (BS.length $ payload p)
 -- the connection returned
 data Connection = Conn {
     send :: ByteString -> IO ()
-  , recvLen :: Int -> IO (ByteString, Int)
   , recv :: Int -> IO ByteString
   , close :: IO ()
   }
@@ -204,7 +181,7 @@ instance Serialize Packet where
     putWord8 ((shiftR (fromJust $ P.lookup packetType $
                 P.map swap packetTypeMap) 4) + version)
     putWord8 extensions 
-    putWord16be connectionId
+    putWord16be connId
     putWord32be timeDiff 
     putWord32be windowSize
     putWord16be seqNum 
@@ -212,11 +189,37 @@ instance Serialize Packet where
     putByteString payload
 
 
+takeBytes c b = (\(cs, dq) -> (BS.concat cs, dq) ) $ go c b
+  where
+   go count buf
+     | DQ.length buf == 0 || count == 0  = ([], buf)
+     | otherwise = if' (count >= topLen)
+                     (top : chunks, rest) 
+                     ([lastChunk], pushFront tail bsRest)
+       where
+         (Just top, tail) = popFront buf
+         topLen = BS.length top
+         (chunks, rest) = go (count - topLen) tail -- lazy 
+         (lastChunk, bsRest) = BS.splitAt count top
+
+recvPub conn len = do
+  atomically $ do
+    incoming <- readTVar (inBuf conn)
+    let (bytes, rest) =  takeBytes len incoming
+    writeTVar (inBuf conn) rest
+    return bytes
+ 
+makeConnection :: ConnData -> IO Connection
+makeConnection conn = do
+  let send = \payload -> sendPacket (makePacket ST_DATA payload conn) conn
+  return $ Conn send (recvPub conn) (return ())
+
 -- warning: partial initialization
 makePacket pType load conn
-  = Packet {packetType = pType, payload = load, connectionId = connIdRecv conn}
-{-
+  = Packet {packetType = pType, payload = load, connId = connIdRecv conn
+           , version = versionNum, extensions = 0}
 
+{-
   this function sets the following fields of packet
     time :: Time
     timeDiff :: Time
@@ -228,7 +231,7 @@ sendPacket packet conn = do
   sequenced <- atomically $ do
     state <- readTVar $ connState conn 
     out <- readTVar $ outBuf conn
-    -- if there is no space in the buffer just block
+    -- if there is no space in the buffer block and retry later
     when (maxWindow state < fromIntegral ((packetSize packet) + dqSize out packetSize))
       retry
     writeTVar (outBuf conn) (pushBack out packet)
@@ -244,44 +247,36 @@ sendPacket packet conn = do
   return ()
 
 -- TODO: remove
-fooConn = Conn (\bs -> return ()) (\n -> return ("", 0)) (\n -> return "") (return () )
+fooConn = Conn (\bs -> return ()) (\n -> return "") (return () )
 
 
 -- what a client calls
-utpConnect :: MonadIO m => Socket -> m Connection
+utpConnect :: Socket -> IO Connection
 utpConnect sock = do
-  g <- liftIO $ newStdGen
+  g <- newStdGen
   let randId = P.head $ (randoms g :: [Word16])
-  let initState = ConnState {connSeqNum = 1,
-                            connAckNum = 0,
-                            connStage = CS_SYN_SENT,
-                            maxWindow = defWindowSize,
-                            peerMaxWindow = defWindowSize,
-                            replyMicro = 0}
- 
-  stateVar <- liftIO $ newTVarIO initState 
-  inBufVar <- liftIO $ newTVarIO DQ.empty 
-  outBufVar <- liftIO $ newTVarIO DQ.empty 
-  let conn = ConnData stateVar inBufVar outBufVar sock randId (randId + 1)
 
-  startHS <- liftIO $ getTimeMicros
-  liftIO $ sendPacket (makePacket ST_SYN "" conn) conn
+  conn <- liftIO $ initConn randId (randId + 1) 1 0 sock
+
+  sendPacket (makePacket ST_SYN "" conn) conn
 
   -- run resend thread
-  liftIO $ forkIO $ setInterval defResendTimeout $ resendOutgoing conn
+  forkIO $ setInterval defResendTimeout $ resendOutgoing conn
 
-  asyncRecv <- liftIO $ async (ackRecv conn) -- waiting for the first ack
-  fstAck <- liftIO $ wait asyncRecv
-  endHS <- liftIO $ getTimeMicros 
-  let initRtt = endHS - startHS 
-   
-  -- things worked out 
-  liftIO $ atomically $ modifyTVar (connState conn)
-           (\s -> s {connStage = CS_CONNECTED, connAckNum = seqNum fstAck})
-
+  let recvF = fmap P.fst $ recvPacket (connSocket conn) recvSize
 
   -- block here until syn-ack stage is done
-  return $ fooConn 
+  fstAck <- liftIO $ ackRecv recvF conn
+  -- handshake is succseful
+
+  atomically $ modifyTVar (connState conn)
+           (\s -> s {connStage = CS_CONNECTED, connAckNum = seqNum fstAck})
+
+  -- run recv thread
+  forkIO $ forever (recvF >>= recvIncoming conn)
+  
+  makeConnection conn
+   
 data UTPException = FailedHandshake deriving (Show, Typeable)
 instance Exception UTPException
 
@@ -291,9 +286,10 @@ instance Exception UTPException
   like at most 100 connections
 
   TODO: figure out how to graciously kill this.
+
+  It has a thread listening on the socket and dispatching
+  incoming udp packets to the responsible threads
 -}
-
-
 utpListen :: Socket -> (SockAddr -> Connection -> IO()) -> IO ()
 utpListen sock handle = do
   connMapVar <- newTVarIO Map.empty
@@ -318,39 +314,37 @@ serverHandshake :: TChan Packet -> Socket -> SockAddr -> IO Connection
 serverHandshake packChan sock sockAddr  = do
   packet <- atomically $ readTChan packChan 
   when (packetType packet /= ST_SYN) $ throwIO FailedHandshake
-  -- start acking and return the connection 
-  return undefined
+
+  g <- liftIO $ newStdGen
+  let randNum = P.head $ (randoms g :: [Word16])
+  conn <- initConn (connId packet) (connId packet + 1) randNum (seqNum packet) sock
+
+  let recvF = atomically $ readTChan packChan
+  forkIO $ setInterval defResendTimeout $ resendOutgoing conn
+  -- run recv thread
+  forkIO $ forever (recvF >>= recvIncoming conn)
+  makeConnection conn
 
 -- loops until it reads a valid packet
 recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
     (msg, src) <- liftIO $ NSB.recvFrom sock recvSize
     case (DS.decode msg :: Either String Packet) of
-      Left err -> do
-        -- keep looping listening for packets
-        -- TODO: maybe this should be more strict and close the connection
-        liftIO $ errorM utplogger "Unparsable package"
+      -- ignore and keep looping listening for packets
+      Left err -> liftIO $ infoM utplogger "non-utp package received"
+
       Right packet -> left (packet, src) -- exit loop
 
  
 getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ liftIO $ getPOSIXTime
 setInterval t f = forever $ threadDelay t >> f
 
-ackRecv conn = do
-  packet <- fmap P.fst $ recvPacket (connSocket conn) recvSize
+ackRecv recv conn = do
+  packet <- recv
   case (packetType packet) of
     ST_STATE -> handleAck conn packet >> return packet
     _ -> do
       liftIO $ errorM utplogger "got something other than ack"
       liftIO $ throwIO FailedHandshake
-
-resendSyn conn = do
-  x <- runEitherT $ forever $ do
-    state <- liftIO $ atomically $ readTVar (connState conn)    
-    when (connStage state /= CS_SYN_SENT) $ left () -- exit the loop
-    liftIO $ sendPacket (makePacket ST_SYN "" conn) conn
-    liftIO $ threadDelay $ defResendTimeout
-  return ()
-
 
 -- takes first elems returning remaining DQ
 dqTakeWhile :: Dequeue q => (a -> Bool) -> q a -> ([a], q a)
@@ -369,8 +363,6 @@ resendOutgoing conn = do
   outgoing <- atomically $ readTVar (outBuf conn)
   forM (dqToList outgoing) $ \p -> NSB.send (connSocket conn) $ DS.encode p
   return ()
- 
- 
 
 recvIncoming :: ConnData -> Packet ->  IO ()
 recvIncoming conn packet = case packetType packet of
@@ -388,9 +380,62 @@ recvIncoming conn packet = case packetType packet of
         modifyTVar (connState conn) (\s -> s {connAckNum = seqNum packet})
     sendPacket (makePacket ST_STATE "" conn) conn -- ack
 
-      
-      
+
+initConn :: ConnectionId -> ConnectionId -> SeqNum -> AckNum -> Socket -> IO ConnData
+initConn recvId sendId initSeqNum initAckNum sock = do
+  let initState = ConnState {connSeqNum = initSeqNum,
+                            connAckNum = initAckNum,
+                            connStage = CS_SYN_SENT,
+                            maxWindow = defWindowSize,
+                            peerMaxWindow = defWindowSize,
+                            replyMicro = 0}
+ 
+  stateVar <- newTVarIO initState 
+  inBufVar <- newTVarIO DQ.empty 
+  outBufVar <- newTVarIO DQ.empty 
+  return $ ConnData stateVar inBufVar outBufVar sock recvId sendId 
+
+
+
+-- TEST Setup
+
+-- create 2 UDP sockets tunnel through them
+
+echoPort = 9901
+
+maxline = 1500
+
+
+clientUDP :: IO ()
+clientUDP = do
+  withSocketsDo $ do
+    P.putStrLn "running"
+    sock <- socket AF_INET Datagram 0
+    NS.connect sock (SockAddrInet echoPort (toWord32 [127, 0, 0, 1]))
+    NS.send sock "hello"
+    P.putStrLn "sent message "
+    resp <- NS.recv sock 2
+    P.putStrLn resp
+
+
+echoserver :: IO ()
+echoserver = do
+           withSocketsDo $ do
+                   sock <- socket AF_INET Datagram 0
+                   bindSocket sock (SockAddrInet echoPort iNADDR_ANY)
+                   socketEcho sock
+
+
+socketEcho :: Socket -> IO ()
+socketEcho sock = do
+           (mesg, recv_count, client) <- NS.recvFrom sock maxline
+           P.putStrLn $ "got message " ++ (show mesg)
+           send_count <- NS.sendTo sock mesg client
+           socketEcho sock
+
 
 -- helpers 
 if' c a b = if c then a else b
 unwrapLeft (Left x) = x
+toWord32 :: [Word8] -> Word32
+toWord32 = P.foldr (\o a -> (a `shiftL` 8) .|. fromIntegral o) 0
