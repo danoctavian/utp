@@ -96,6 +96,7 @@ type SeqNum = Word16
 type AckNum = Word16
 type Time = Word32
 type ConnectionId = Word16
+type SockSend = ByteString -> IO Int
 
 data PacketType = ST_DATA | ST_FIN | ST_STATE | ST_RESET | ST_SYN 
   deriving (Eq, Show)
@@ -111,6 +112,8 @@ data Packet = Packet {
     ackNum :: AckNum,
     payload :: ByteString
   } deriving (Show, Eq)
+
+defPacket = Packet ST_SYN 0 0 0 0 0 0 0 0 ""
 
 -- CONSTANTS
 headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
@@ -138,6 +141,7 @@ data ConnData = ConnData {
   , inBuf :: TVar (BankersDequeue ByteString) 
   , outBuf :: TVar (BankersDequeue Packet)
   , connSocket :: Socket
+  , sockSend :: SockSend 
   , connIdRecv ::ConnectionId
   , connIdSend ::ConnectionId
   }
@@ -178,10 +182,11 @@ instance Serialize Packet where
                                 <*> getWord16be  <*> getWord16be <*> getRest
   -- assumes valid packet
   put Packet {..} = do
-    putWord8 ((shiftR (fromJust $ P.lookup packetType $
+    putWord8 ((shiftL (fromJust $ P.lookup packetType $
                 P.map swap packetTypeMap) 4) + version)
     putWord8 extensions 
     putWord16be connId
+    putWord32be time
     putWord32be timeDiff 
     putWord32be windowSize
     putWord16be seqNum 
@@ -205,6 +210,7 @@ takeBytes c b = (\(cs, dq) -> (BS.concat cs, dq) ) $ go c b
 recvPub conn len = do
   atomically $ do
     incoming <- readTVar (inBuf conn)
+    when (DQ.length incoming == 0) retry -- empty buffer
     let (bytes, rest) =  takeBytes len incoming
     writeTVar (inBuf conn) rest
     return bytes
@@ -216,7 +222,7 @@ makeConnection conn = do
 
 -- warning: partial initialization
 makePacket pType load conn
-  = Packet {packetType = pType, payload = load, connId = connIdRecv conn
+  = defPacket {packetType = pType, payload = load, connId = connIdRecv conn
            , version = versionNum, extensions = 0}
 
 {-
@@ -228,22 +234,30 @@ makePacket pType load conn
     ackNum :: AckNum
 -} 
 sendPacket packet conn = do
+  debugM  utplogger $ "building packet..."
+ 
   sequenced <- atomically $ do
     state <- readTVar $ connState conn 
     out <- readTVar $ outBuf conn
-    -- if there is no space in the buffer block and retry later
-    when (maxWindow state < fromIntegral ((packetSize packet) + dqSize out packetSize))
-      retry
-    writeTVar (outBuf conn) (pushBack out packet)
     let currSeq = connSeqNum state
-    writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
+
+    -- acks are not buffered and don't inc sequence number
+    when (packetType packet /= ST_STATE) $ do
+
+      -- if there is no space in the buffer block and retry later
+      when (maxWindow state < fromIntegral ((packetSize packet) + dqSize out packetSize))
+        retry
+      writeTVar (outBuf conn) (pushBack out packet)
+      writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
 
     inB <- readTVar $ inBuf conn
     return $ packet {seqNum = currSeq, ackNum = connAckNum state
                     , timeDiff = replyMicro state
                     , windowSize = fromIntegral $ dqSize inB (BS.length)}
+
+  debugM  utplogger $ "sending packet..." ++ (show sequenced)
   micros <- getTimeMicros 
-  liftIO $ NSB.send (connSocket conn) (DS.encode $ sequenced {time = micros})        
+  (sockSend conn) (DS.encode $ sequenced {time = micros})        
   return ()
 
 -- TODO: remove
@@ -256,8 +270,9 @@ utpConnect sock = do
   g <- newStdGen
   let randId = P.head $ (randoms g :: [Word16])
 
-  conn <- liftIO $ initConn randId (randId + 1) 1 0 sock
+  conn <- initConn randId (randId + 1) 1 0 sock (NSB.send sock)
 
+  debugM utplogger "sending syn"
   sendPacket (makePacket ST_SYN "" conn) conn
 
   -- run resend thread
@@ -315,9 +330,15 @@ serverHandshake packChan sock sockAddr  = do
   packet <- atomically $ readTChan packChan 
   when (packetType packet /= ST_SYN) $ throwIO FailedHandshake
 
+  debugM utplogger "received syn packet"
+
   g <- liftIO $ newStdGen
   let randNum = P.head $ (randoms g :: [Word16])
-  conn <- initConn (connId packet) (connId packet + 1) randNum (seqNum packet) sock
+  conn <- initConn (connId packet) (connId packet + 1) randNum (seqNum packet)
+          sock (\bs -> NSB.sendTo sock bs sockAddr)
+
+  -- send ack for syn
+  sendPacket (makePacket ST_STATE "" conn) conn
 
   let recvF = atomically $ readTChan packChan
   forkIO $ setInterval defResendTimeout $ resendOutgoing conn
@@ -355,34 +376,32 @@ dqTakeWhile cond dq = case DQ.length dq of
           ((fromJust $ DQ.first dq) : taken, rest) 
           ([], dq)
 
-
 handleAck conn packet = atomically $ modifyTVar (outBuf conn)
                 (P.snd . (dqTakeWhile ((<= ackNum packet) . seqNum)))
 
 resendOutgoing conn = do
   outgoing <- atomically $ readTVar (outBuf conn)
-  forM (dqToList outgoing) $ \p -> NSB.send (connSocket conn) $ DS.encode p
+  forM (dqToList outgoing) $ \p -> sockSend conn $ DS.encode p
   return ()
 
 recvIncoming :: ConnData -> Packet ->  IO ()
 recvIncoming conn packet = case packetType packet of
   ST_SYN -> do
-    atomically $ modifyTVar (connState conn)
-                  (\s -> s {connAckNum = seqNum packet
-                          , connStage = CS_CONNECTED})
+    debugM utplogger "received syn packet"
     sendPacket (makePacket ST_STATE "" conn) conn
   ST_STATE -> handleAck conn packet
   ST_DATA -> do
     atomically $ do
       stateNow <- readTVar $ connState conn
-      when (connAckNum stateNow + 1 == ackNum packet) $ do
+      when (connAckNum stateNow + 1 == seqNum packet) $ do
         modifyTVar (inBuf conn) (P.flip DQ.pushBack $ payload packet)
         modifyTVar (connState conn) (\s -> s {connAckNum = seqNum packet})
     sendPacket (makePacket ST_STATE "" conn) conn -- ack
 
 
-initConn :: ConnectionId -> ConnectionId -> SeqNum -> AckNum -> Socket -> IO ConnData
-initConn recvId sendId initSeqNum initAckNum sock = do
+initConn :: ConnectionId -> ConnectionId -> SeqNum
+         -> AckNum -> Socket -> SockSend -> IO ConnData
+initConn recvId sendId initSeqNum initAckNum sock send = do
   let initState = ConnState {connSeqNum = initSeqNum,
                             connAckNum = initAckNum,
                             connStage = CS_SYN_SENT,
@@ -393,9 +412,7 @@ initConn recvId sendId initSeqNum initAckNum sock = do
   stateVar <- newTVarIO initState 
   inBufVar <- newTVarIO DQ.empty 
   outBufVar <- newTVarIO DQ.empty 
-  return $ ConnData stateVar inBufVar outBufVar sock recvId sendId 
-
-
+  return $ ConnData stateVar inBufVar outBufVar sock send recvId sendId 
 
 -- TEST Setup
 
@@ -433,6 +450,36 @@ socketEcho sock = do
            send_count <- NS.sendTo sock mesg client
            socketEcho sock
 
+
+clientUTP =  do
+  updateGlobalLogger utplogger (setLevel DEBUG)
+  withSocketsDo $ do
+    P.putStrLn "running"
+    sock <- socket AF_INET Datagram 0
+    NS.connect sock (SockAddrInet echoPort (toWord32 [127, 0, 0, 1]))
+    conn <- utpConnect sock
+    Network.UTP.send conn  "hello"
+    P.putStrLn "sent message "
+    resp <- Network.UTP.recv conn 2
+    P.putStrLn $ show resp
+
+
+utpechoserver :: IO ()
+utpechoserver = do
+  updateGlobalLogger utplogger (setLevel DEBUG)
+  withSocketsDo $ do
+    sock <- socket AF_INET Datagram 0
+    bindSocket sock (SockAddrInet echoPort iNADDR_ANY)
+    utpListen sock  utpsocketEcho
+
+
+utpsocketEcho :: SockAddr -> Connection -> IO ()
+utpsocketEcho addr conn = forever $ do
+           mesg  <- Network.UTP.recv conn maxline
+           P.putStrLn $ "got message from utp socket " ++ (show mesg)
+           send_count <- Network.UTP.send conn mesg 
+           return ()
+--           send_count <- NS.sendTo sock mesg client
 
 -- helpers 
 if' c a b = if c then a else b
