@@ -421,42 +421,20 @@ initConn recvId sendId initSeqNum initAckNum sock send = do
   outBufVar <- newTVarIO DQ.empty 
   return $ ConnData stateVar inBufVar outBufVar sock send recvId sendId 
 
--- TEST Setup
+
+-- helpers 
+if' c a b = if c then a else b
+unwrapLeft (Left x) = x
+toWord32 :: [Word8] -> Word32
+toWord32 = P.foldr (\o a -> (a `shiftL` 8) .|. fromIntegral o) 0
+
+-- manual debugging Setup
 
 -- create 2 UDP sockets tunnel through them
 
 echoPort = 9901
 
 maxline = 1500
-
-
-clientUDP :: IO ()
-clientUDP = do
-  withSocketsDo $ do
-    P.putStrLn "running"
-    sock <- socket AF_INET Datagram 0
-    NS.connect sock (SockAddrInet echoPort (toWord32 [127, 0, 0, 1]))
-    NS.send sock "hello"
-    P.putStrLn "sent message "
-    resp <- NS.recv sock 2
-    P.putStrLn resp
-
-
-echoserver :: IO ()
-echoserver = do
-           withSocketsDo $ do
-                   sock <- socket AF_INET Datagram 0
-                   bindSocket sock (SockAddrInet echoPort iNADDR_ANY)
-                   socketEcho sock
-
-
-socketEcho :: Socket -> IO ()
-socketEcho sock = do
-           (mesg, recv_count, client) <- NS.recvFrom sock maxline
-           P.putStrLn $ "got message " ++ (show mesg)
-           send_count <- NS.sendTo sock mesg client
-           socketEcho sock
-
 
 clientUTP =  do
   updateGlobalLogger utplogger (setLevel DEBUG)
@@ -488,8 +466,4 @@ utpsocketEcho addr conn = forever $ do
            return ()
 --           send_count <- NS.sendTo sock mesg client
 
--- helpers 
-if' c a b = if c then a else b
-unwrapLeft (Left x) = x
-toWord32 :: [Word8] -> Word32
-toWord32 = P.foldr (\o a -> (a `shiftL` 8) .|. fromIntegral o) 0
+
