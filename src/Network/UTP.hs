@@ -340,6 +340,9 @@ serverHandshake packChan sock sockAddr  = do
   -- send ack for syn
   sendPacket (makePacket ST_STATE "" conn) conn
 
+  -- only the first ack increments the sequence number
+  atomically $ modifyTVar (connState conn) (\s -> s {connSeqNum = connSeqNum s + 1})
+
   let recvF = atomically $ readTChan packChan
   forkIO $ setInterval defResendTimeout $ resendOutgoing conn
   -- run recv thread
@@ -391,6 +394,7 @@ recvIncoming conn packet = case packetType packet of
     sendPacket (makePacket ST_STATE "" conn) conn
   ST_STATE -> handleAck conn packet
   ST_DATA -> do
+    debugM utplogger $ "received data packet " ++ (show packet)
     inB <- atomically $ do
       stateNow <- readTVar $ connState conn
       when (connAckNum stateNow + 1 == seqNum packet) $ do
