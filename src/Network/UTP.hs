@@ -33,6 +33,21 @@ import Control.Exception
 import Data.Typeable
 import Data.HashTable.IO
 import Data.Map.Strict as Map 
+
+{-
+
+TODO: missing features
+
+** packet loss
+** window resizing
+** rtt based timeouts 
+** keep alive
+** circular buffer implementation for efficient send recv
+** proper resource handling - in case of excpetion and gracious closing
+
+** testing with unreliable networks
+-}
+
 {-
 CIRCULAR BUFFER IDEA
 a circular buffer can achieve the adding and consuming of the buffer
@@ -40,17 +55,18 @@ no problem about providing a stream based interface here.
 
 need to work with some sort of mutable bytestrings.
 
-buffer expansion means:  copy everything in the new buffer
+buffer expansion/reduction means:  copy everything in the new buffer
   if bigger all good
   if smaller ? do you just dump packets
 
-dump the circular packet idea. it's problematic if an ack for a packet inbetween other packets comes in. how do you deal with the whole without copying a large amount of data?
 
-LEAVE OUT SELECTIVE ACK for now
+Acking ahead
 
-need to send continous keepalive (ack for the current packet)
+maybe it's problematic if an ack for a packet inbetween other packets comes in. how do you deal with the whole without copying a large amount of data?
 
-keep acking regularly for the last received package. if you receive 
+without selective ack - the above is a non issue 
+with selective ack - you still need to wait for all packets to provide ordered data receive.so it's not reall an issue - 
+
 
 there's a haskell package for UTP by sam truszan
 but that code is just too smart for me
@@ -75,17 +91,7 @@ need to kill associated threads
 keep track of their threadId in the ConnData
 close socket as well
 
-
 -}
-
-{-
-
-TODO: missing features
-
-** window resizing
-** rtt based timeouts 
--}
-
 
 -- logging
 utplogger = "utplog"
@@ -100,6 +106,9 @@ type SockSend = ByteString -> IO Int
 
 data PacketType = ST_DATA | ST_FIN | ST_STATE | ST_RESET | ST_SYN 
   deriving (Eq, Show)
+
+packetTypeMap = P.zip [0, 1..] [ST_DATA, ST_FIN, ST_STATE, ST_RESET, ST_SYN]
+
 data Packet = Packet {
     packetType :: PacketType,
     version :: Word8,
@@ -118,13 +127,25 @@ defPacket = Packet ST_FIN 0 0 0 0 0 0 0 0 ""
 -- CONSTANTS
 headerSize = BS.length $ DS.encode $ Packet ST_DATA 0 0 0 0 0 0 0 0 ""
 defWindowSize = 500
+
+-- total size of the receive buffer
+-- TODO: figure out what to do with this; currently not used
 recvBufferSize = 10000
-recvSize = 2048 -- TODO: really need to have some logic behind this value
+
+-- how many bytes to read in a socket receive operation
+-- TODO: really need to have some logic behind this value
+-- currently it's the value found in libtorrent
+-- if a packet is bigger than this protocol logic fails
+-- since packet
+recvSize = 4096
 versionNum = 1
 
 defResendTimeout = 5 * 10 ^ 5
 
 packetSize p = headerSize + (BS.length $ payload p)
+
+-- how many duplicate acks to receive before marking a packet as lost
+lossDupAcks = 3
 
 -- the connection returned
 data Connection = Conn {
@@ -132,7 +153,6 @@ data Connection = Conn {
   , recv :: Int -> IO ByteString
   , close :: IO ()
   }
-
 
 data ConnStage = CS_SYN_SENT | CS_CONNECTED | ERROR deriving (Show, Eq)
 
@@ -147,13 +167,6 @@ data ConnData = ConnData {
   }
 
 
--- dumb summing up of sizes
--- optimize by keeping track of size on removal and insertion
-dqSize :: Dequeue q => q a -> (a -> Int)  -> Int
-dqSize dq len = P.sum $ P.map len $ dqToList dq
-
-dqToList dq = DQ.takeFront (DQ.length dq) dq
-
 data ConnState = ConnState {
     connSeqNum :: SeqNum
   , connAckNum :: AckNum
@@ -161,136 +174,10 @@ data ConnState = ConnState {
   , peerMaxWindow :: Word32 -- window size advertised by peer
   , replyMicro :: Time
   , connStage :: ConnStage
+  , dupAcks :: Int
+  , lastAckRecv :: AckNum
   }
 
-packetTypeMap = P.zip [0, 1..] [ST_DATA, ST_FIN, ST_STATE, ST_RESET, ST_SYN]
-
-getTypeVersion = do
-  byte <- getWord8 
-  let packType = P.lookup (shiftR byte 4) packetTypeMap
-  let version = shiftR (shiftL byte 4) 4
-  case packType of 
-    Just typeVal ->  return (typeVal, version)
-    Nothing -> fail "unknown packet type"
-
-
-getRest = remaining >>= getBytes
-instance Serialize Packet where
-  get = (\(t, v) -> Packet t v) <$> getTypeVersion <*> getWord8 <*> getWord16be
-                                <*>  getWord32be <*> getWord32be <*> getWord32be
-                                <*> getWord16be  <*> getWord16be <*> getRest
-  -- assumes valid packet
-  put Packet {..} = do
-    putWord8 ((shiftL (fromJust $ P.lookup packetType $
-                P.map swap packetTypeMap) 4) + version)
-    putWord8 extensions 
-    putWord16be connId
-    putWord32be time
-    putWord32be timeDiff 
-    putWord32be windowSize
-    putWord16be seqNum 
-    putWord16be ackNum 
-    putByteString payload
-
-
-takeBytes c b = (\(cs, dq) -> (BS.concat cs, dq) ) $ go c b
-  where
-   go count buf
-     | DQ.length buf == 0 || count == 0  = ([], buf)
-     | otherwise = if' (count >= topLen)
-                     (top : chunks, rest) 
-                     ([lastChunk], pushFront tail bsRest)
-       where
-         (Just top, tail) = popFront buf
-         topLen = BS.length top
-         (chunks, rest) = go (count - topLen) tail -- lazy 
-         (lastChunk, bsRest) = BS.splitAt count top
-
-recvPub conn len = do
-  atomically $ do
-    incoming <- readTVar (inBuf conn)
-    when (DQ.length incoming == 0) retry -- empty buffer
-    let (bytes, rest) =  takeBytes len incoming
-    writeTVar (inBuf conn) rest
-    return bytes
- 
-makeConnection :: ConnData -> IO Connection
-makeConnection conn = do
-  let send = \payload -> sendPacket (makePacket ST_DATA payload conn) conn
-  return $ Conn send (recvPub conn) (return ())
-
--- warning: partial initialization
-makePacket pType load conn
-  = defPacket {packetType = pType, payload = load, connId = connIdRecv conn
-           , version = versionNum, extensions = 0}
-
-{-
-  this function sets the following fields of packet
-    time :: Time
-    timeDiff :: Time
-    windowSize :: Word32
-    seqNum :: SeqNum
-    ackNum :: AckNum
--} 
-sendPacket packet conn = do
-  debugM  utplogger $ "building packet..."
- 
-  sequenced <- atomically $ do
-    state <- readTVar $ connState conn 
-    out <- readTVar $ outBuf conn
-    let currSeq = connSeqNum state
-    inB <- readTVar $ inBuf conn
-    let sequenced = packet {seqNum = currSeq, ackNum = connAckNum state
-                    , timeDiff = replyMicro state
-                    , windowSize = fromIntegral $ dqSize inB (BS.length)}
-
-    -- acks are not buffered and don't inc sequence number
-    when (packetType sequenced /= ST_STATE) $ do
-      -- if there is no space in the buffer block and retry later
-      when (maxWindow state < fromIntegral ((packetSize sequenced) + dqSize out packetSize))
-        retry
-      writeTVar (outBuf conn) (pushBack out sequenced)
-      writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
-    return sequenced
-
-  micros <- getTimeMicros 
-  let timestamped = sequenced {time = micros}
-  debugM  utplogger $ "sending packet..." ++ (show timestamped)
-  (sockSend conn) (DS.encode $ timestamped)        
-  return ()
-
--- TODO: remove
-fooConn = Conn (\bs -> return ()) (\n -> return "") (return () )
-
-
--- what a client calls
-utpConnect :: Socket -> IO Connection
-utpConnect sock = do
-  g <- newStdGen
-  let randId = P.head $ (randoms g :: [Word16])
-
-  conn <- initConn randId (randId + 1) 1 0 sock (NSB.send sock)
-
-  debugM utplogger "sending syn"
-  sendPacket (makePacket ST_SYN "" conn) conn
-
-  -- run resend thread
-  forkIO $ setInterval defResendTimeout $ resendOutgoing conn
-
-  let recvF = fmap P.fst $ recvPacket (connSocket conn) recvSize
-
-  -- block here until syn-ack stage is done
-  fstAck <- ackRecv recvF conn
-  -- handshake is succseful
-
-  atomically $ modifyTVar (connState conn)
-           (\s -> s {connStage = CS_CONNECTED, connAckNum = seqNum fstAck})
-
-  -- run recv thread
-  forkIO $ forever (recvF >>= recvIncoming conn)
-  
-  makeConnection conn
-   
 data UTPException = FailedHandshake deriving (Show, Typeable)
 instance Exception UTPException
 
@@ -349,6 +236,34 @@ serverHandshake packChan sock sockAddr  = do
   forkIO $ forever (recvF >>= recvIncoming conn)
   makeConnection conn
 
+-- what a client calls
+utpConnect :: Socket -> IO Connection
+utpConnect sock = do
+  g <- newStdGen
+  let randId = P.head $ (randoms g :: [Word16])
+
+  conn <- initConn randId (randId + 1) 1 0 sock (NSB.send sock)
+
+  debugM utplogger "sending syn"
+  sendPacket (makePacket ST_SYN "" conn) conn
+
+  -- run resend thread
+  forkIO $ setInterval defResendTimeout $ resendOutgoing conn
+
+  let recvF = fmap P.fst $ recvPacket (connSocket conn) recvSize
+
+  -- block here until syn-ack stage is done
+  fstAck <- ackRecv recvF conn
+  -- handshake is succseful
+
+  atomically $ modifyTVar (connState conn)
+           (\s -> s {connStage = CS_CONNECTED, connAckNum = seqNum fstAck})
+
+  -- run recv thread
+  forkIO $ forever (recvF >>= recvIncoming conn)
+  
+  makeConnection conn
+   
 -- loops until it reads a valid packet
 recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
     (msg, src) <- liftIO $ NSB.recvFrom sock recvSize
@@ -358,10 +273,58 @@ recvPacket sock recvSize = fmap unwrapLeft $ runEitherT $ forever $ do
 
       Right packet -> left (packet, src) -- exit loop
 
- 
-getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ getPOSIXTime
-setInterval t f = forever $ threadDelay t >> f
+makeConnection :: ConnData -> IO Connection
+makeConnection conn = do
+  let send = \payload -> sendPacket (makePacket ST_DATA payload conn) conn
+  return $ Conn send (recvPub conn) (return ())
 
+recvPub conn len = do
+  atomically $ do
+    incoming <- readTVar (inBuf conn)
+    when (DQ.length incoming == 0) retry -- empty buffer
+    let (bytes, rest) =  takeBytes len incoming
+    writeTVar (inBuf conn) rest
+    return bytes
+
+makePacket pType load conn
+  = defPacket {packetType = pType, payload = load, connId = connIdRecv conn
+           , version = versionNum, extensions = 0}
+
+{-
+  this function sets the following fields of packet
+    time :: Time
+    timeDiff :: Time
+    windowSize :: Word32
+    seqNum :: SeqNum
+    ackNum :: AckNum
+-} 
+sendPacket packet conn = do
+  debugM  utplogger $ "building packet..."
+ 
+  sequenced <- atomically $ do
+    state <- readTVar $ connState conn 
+    out <- readTVar $ outBuf conn
+    let currSeq = connSeqNum state
+    inB <- readTVar $ inBuf conn
+    let sequenced = packet {seqNum = currSeq, ackNum = connAckNum state
+                    , timeDiff = replyMicro state
+                    , windowSize = fromIntegral $ recvBufferSize -  dqSize inB (BS.length)}
+
+    -- acks are not buffered and don't inc sequence number
+    when (packetType sequenced /= ST_STATE) $ do
+      -- if there is no space in the buffer block and retry later
+      when (maxWindow state < fromIntegral ((packetSize sequenced) + dqSize out packetSize))
+        retry
+      writeTVar (outBuf conn) (pushBack out sequenced)
+      writeTVar (connState conn) (state {connSeqNum = currSeq + 1})
+    return sequenced
+
+  micros <- getTimeMicros 
+  let timestamped = sequenced {time = micros}
+  debugM  utplogger $ "sending packet..." ++ (show timestamped)
+  (sockSend conn) (DS.encode $ timestamped)        
+  return ()
+ 
 ackRecv recv conn = do
   packet <- recv
   case (packetType packet) of
@@ -370,17 +333,26 @@ ackRecv recv conn = do
       errorM utplogger "got something other than ack"
       throwIO FailedHandshake
 
--- takes first elems returning remaining DQ
-dqTakeWhile :: Dequeue q => (a -> Bool) -> q a -> ([a], q a)
-dqTakeWhile cond dq = case DQ.length dq of
-  0 -> ([], dq)
-  _ -> let (taken, rest) = dqTakeWhile cond (P.snd $ popFront dq) in 
-         if' (cond $ fromJust $ DQ.first dq)
-          ((fromJust $ DQ.first dq) : taken, rest) 
-          ([], dq)
 
-handleAck conn packet = atomically $ modifyTVar (outBuf conn)
-                (P.snd . (dqTakeWhile ((<= ackNum packet) . seqNum)))
+handleAck conn packet = do
+  lostPacket <- atomically $ do
+    modifyTVar (outBuf conn) (P.snd . (dqTakeWhile ((<= ackNum packet) . seqNum)))
+
+    -- handle duplicate acks
+    state <- readTVar (connState conn)
+    
+    let dup = lastAckRecv state == ackNum packet
+    let reachedLimit = dupAcks state + 1 >= lossDupAcks
+    if' dup
+      (if' reachedLimit 
+        (modifyTVar (outBuf conn) (P.snd . popFront)) -- drop that packet
+        (modifyTVar (connState conn) (\s -> s {dupAcks = dupAcks s + 1}) ))
+
+      -- new ack coming in; reset state
+      (modifyTVar (connState conn) (\s -> s {dupAcks = 0, lastAckRecv = ackNum packet}))
+    return $ dup && reachedLimit -- return if packet loss happened
+  when lostPacket $ errorM utplogger "lost packet!"
+    
 
 resendOutgoing conn = do
   outgoing <- atomically $ readTVar (outBuf conn)
@@ -414,7 +386,9 @@ initConn recvId sendId initSeqNum initAckNum sock send = do
                             connStage = CS_SYN_SENT,
                             maxWindow = defWindowSize,
                             peerMaxWindow = defWindowSize,
-                            replyMicro = 0}
+                            replyMicro = 0,
+                            dupAcks = 0,
+                            lastAckRecv = 0} 
  
   stateVar <- newTVarIO initState 
   inBufVar <- newTVarIO DQ.empty 
@@ -422,7 +396,72 @@ initConn recvId sendId initSeqNum initAckNum sock send = do
   return $ ConnData stateVar inBufVar outBufVar sock send recvId sendId 
 
 
--- helpers 
+-- PACKET SERIALIZATION
+
+instance Serialize Packet where
+  get = (\(t, v) -> Packet t v) <$> getTypeVersion <*> getWord8 <*> getWord16be
+                                <*>  getWord32be <*> getWord32be <*> getWord32be
+                                <*> getWord16be  <*> getWord16be <*> getRest
+  -- assumes valid packet
+  put Packet {..} = do
+    putWord8 ((shiftL (fromJust $ P.lookup packetType $
+                P.map swap packetTypeMap) 4) + version)
+    putWord8 extensions 
+    putWord16be connId
+    putWord32be time
+    putWord32be timeDiff 
+    putWord32be windowSize
+    putWord16be seqNum 
+    putWord16be ackNum 
+    putByteString payload
+
+getTypeVersion = do
+  byte <- getWord8 
+  let packType = P.lookup (shiftR byte 4) packetTypeMap
+  let version = shiftR (shiftL byte 4) 4
+  case packType of 
+    Just typeVal ->  return (typeVal, version)
+    Nothing -> fail "unknown packet type"
+
+getRest = remaining >>= getBytes
+
+
+-- HELPERS
+
+getTimeMicros = fmap (\n -> P.round $ n * 10 ^ 6) $ getPOSIXTime
+setInterval t f = forever $ threadDelay t >> f
+
+
+-- take a number of bytes from a dq containing bytestrings
+takeBytes c b = (\(cs, dq) -> (BS.concat cs, dq) ) $ go c b
+  where
+   go count buf
+     | DQ.length buf == 0 || count == 0  = ([], buf)
+     | otherwise = if' (count >= topLen)
+                     (top : chunks, rest) 
+                     ([lastChunk], pushFront tail bsRest)
+       where
+         (Just top, tail) = popFront buf
+         topLen = BS.length top
+         (chunks, rest) = go (count - topLen) tail -- lazy 
+         (lastChunk, bsRest) = BS.splitAt count top
+
+-- takes first elems returning remaining DQ
+dqTakeWhile :: Dequeue q => (a -> Bool) -> q a -> ([a], q a)
+dqTakeWhile cond dq = case DQ.length dq of
+  0 -> ([], dq)
+  _ -> let (taken, rest) = dqTakeWhile cond (P.snd $ popFront dq) in 
+         if' (cond $ fromJust $ DQ.first dq)
+          ((fromJust $ DQ.first dq) : taken, rest) 
+          ([], dq)
+
+-- dumb summing up of sizes
+-- optimize by keeping track of size on removal and insertion
+dqSize :: Dequeue q => q a -> (a -> Int)  -> Int
+dqSize dq len = P.sum $ P.map len $ dqToList dq
+
+dqToList dq = DQ.takeFront (DQ.length dq) dq
+
 if' c a b = if c then a else b
 unwrapLeft (Left x) = x
 toWord32 :: [Word8] -> Word32
