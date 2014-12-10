@@ -190,6 +190,10 @@ instance Exception UTPException
 
   It has a thread listening on the socket and dispatching
   incoming udp packets to the responsible threads
+
+  Potential optimization: to fetch the right socket distribute everything 
+  over a fixed size hashtable with TVars containing sockets (lists, trees)
+  no single contention place in that situation
 -}
 utpListen :: Socket -> (SockAddr -> Connection -> IO()) -> IO ()
 utpListen sock handle = do
