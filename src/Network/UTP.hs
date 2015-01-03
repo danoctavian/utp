@@ -38,12 +38,18 @@ import Data.Map.Strict as Map
 
 TODO: missing features
 
+** refactor interface code to be like
+  makeConn :: Settings -> ConnHandler -> IO ()
+  instead of returning a connection. this way you execute the handler on your 
+  own terms and are able to do resource cleanup on exceptions or when it's done
+  therefore, stop using forkIO and start using async  for worker threads
+** fix the resend policy; now you resend every 500ms regardless of when is the last
+  time you received smth from the other side
 ** packet loss
 ** window resizing
 ** rtt based timeouts 
 ** keep alive
 ** circular buffer implementation for efficient send recv
-** proper resource handling - in case of excpetion and gracious closing
 
 ** testing with unreliable networks
 -}
